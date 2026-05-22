@@ -1,0 +1,38 @@
+# The service/ subfolder is its own repository
+# (https://github.com/AbdelrahmanAtef01/ANUBIX_Server) — managed there.
+service/
+
+# Secrets — never commit
+.env
+*.env
+!*.env.example
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Test / cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/

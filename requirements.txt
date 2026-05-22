@@ -1,0 +1,7 @@
+requests>=2.31
+# Pin paramiko<4 because sshtunnel still references paramiko.DSSKey at import
+# time, which paramiko 4.0 removed. Without this pin: AttributeError on first
+# import of sshtunnel.
+paramiko>=3.4,<4
+sshtunnel>=0.4.0
+supabase>=2.0
