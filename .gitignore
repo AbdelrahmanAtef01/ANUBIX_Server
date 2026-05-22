@@ -1,11 +1,8 @@
-# The service/ subfolder is its own repository
-# (https://github.com/AbdelrahmanAtef01/ANUBIX_Server) — managed there.
-service/
-
 # Secrets — never commit
 .env
 *.env
 !*.env.example
+service/.env
 
 # Python bytecode
 __pycache__/

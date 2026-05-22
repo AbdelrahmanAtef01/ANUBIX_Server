@@ -1,0 +1,43 @@
+# Run from api_client/service/  :  docker compose up --build
+#
+# The build context is the anubix/ root so the Dockerfile can COPY both
+# api_client/ and anubix_ws/agent_config/.
+#
+# For full-fat tailscale (kernel TUN, faster, no SOCKS5 quirks), uncomment
+# the `cap_add` + `devices` blocks. Without them tailscaled falls back to
+# userspace-networking — the api_client still works because paramiko/requests
+# use the tailscale IP via the host network stack (DNS resolved before any
+# tunnel logic runs).
+
+services:
+  anubix-api-client:
+    build:
+      context: ../..                           # the anubix/ root
+      dockerfile: api_client/service/Dockerfile
+    image: anubix-api-client:latest
+    network_mode: "host"
+    container_name: anubix-api-client
+    restart: unless-stopped
+
+    env_file:
+      - /home/ubuntu/.env                                   # see .env.example
+
+    ports:
+      - "6000:6000"
+
+    # Persist tailscale state across container restarts so we don't have to
+    # re-authenticate every boot.
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+
+    # --- Optional: kernel TUN mode (better) ---------------------------------
+    # Uncomment these three lines AND make sure /dev/net/tun exists on the host.
+    # cap_add:
+    #   - NET_ADMIN
+    #   - SYS_MODULE
+    # devices:
+    #   - /dev/net/tun:/dev/net/tun
+    # ------------------------------------------------------------------------
+
+volumes:
+  tailscale-state:
