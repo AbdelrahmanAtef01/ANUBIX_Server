@@ -1,8 +1,22 @@
 #!/usr/bin/env bash
 # Container entrypoint:
-#   1. Boot tailscaled (TUN mode if /dev/net/tun is mounted, else userspace).
+#   1. Boot tailscaled (kernel TUN mode REQUIRED — see below).
 #   2. Optionally `tailscale up` non-interactively if TAILSCALE_AUTHKEY set.
 #   3. Start the FastAPI server.
+#
+# IMPORTANT — TUN mode is mandatory.
+# ─────────────────────────────────
+# The service opens an SSH tunnel to the Jetson over the tailnet. paramiko
+# (under sshtunnel) makes a direct TCP connection — it does NOT speak
+# SOCKS5. Tailscale's userspace-networking mode only routes traffic that
+# goes through its SOCKS5 proxy, so the SSH connection times out with
+# "Could not establish session to SSH gateway" when we run in userspace.
+#
+# Therefore we REQUIRE kernel TUN mode, which needs:
+#   --cap-add NET_ADMIN  --device /dev/net/tun:/dev/net/tun
+# on `docker run`, or the equivalent cap_add/devices blocks in compose.
+# If /dev/net/tun is not present we exit non-zero with a clear error so the
+# container doesn't masquerade as healthy while every /run silently fails.
 #
 # If TAILSCALE_AUTHKEY is NOT set the daemon still starts but the tailnet
 # is NOT joined — the operator must POST /tailscale/up afterwards to get
@@ -11,29 +25,44 @@
 set -euo pipefail
 
 log() { echo "[entrypoint] $*"; }
+die() { echo "[entrypoint] FATAL: $*" >&2; exit 1; }
 
-# ── tailscaled ─────────────────────────────────────────────────────────────
+# ── TUN check ──────────────────────────────────────────────────────────────
+if [[ ! -e /dev/net/tun ]]; then
+    cat >&2 <<'EOF'
+[entrypoint] FATAL: /dev/net/tun is not mounted into the container.
+
+Tailscale's userspace-networking mode CANNOT carry the SSH tunnel this
+service needs (paramiko/sshtunnel make a direct TCP connect; they do not
+go through SOCKS5). Re-launch the container with kernel TUN routing:
+
+    docker run -d --name anubix-api-client \
+        --network host \
+        --cap-add NET_ADMIN \
+        --device /dev/net/tun:/dev/net/tun \
+        --env-file /home/ubuntu/.env \
+        -v anubix-tailscale-state:/var/lib/tailscale \
+        abdelrahmanatef01/anubix-api-client:latest
+
+If you're on docker compose, the cap_add/devices blocks in
+docker-compose.yml are already uncommented for you — `docker compose up`
+should pick them up automatically.
+
+Verify on the host first:
+    ls -l /dev/net/tun           # should print c 10 200 ...
+    sudo modprobe tun            # if missing (rare on EC2 Ubuntu)
+EOF
+    die "missing /dev/net/tun"
+fi
+
+# ── tailscaled (kernel mode) ───────────────────────────────────────────────
 TS_SOCKET=/var/run/tailscale/tailscaled.sock
 mkdir -p "$(dirname "$TS_SOCKET")" /var/lib/tailscale
 
-if [[ -e /dev/net/tun ]]; then
-    log "TUN device available — using kernel networking"
-    TS_MODE_ARGS=()
-else
-    log "no TUN device — falling back to userspace-networking"
-    # In userspace mode tailscale also runs a SOCKS5/HTTP proxy. We don't
-    # route through those (paramiko/requests do direct TCP) — userspace
-    # mode here is mostly a graceful-degrade for hosts without TUN.
-    TS_MODE_ARGS=(--tun=userspace-networking
-                  --socks5-server=localhost:1055
-                  --outbound-http-proxy-listen=localhost:1055)
-fi
-
-log "starting tailscaled..."
+log "TUN device available — starting tailscaled in kernel mode"
 tailscaled \
     --state=/var/lib/tailscale/tailscaled.state \
     --socket="$TS_SOCKET" \
-    "${TS_MODE_ARGS[@]}" \
     >/var/log/tailscaled.log 2>&1 &
 TAILSCALED_PID=$!
 
@@ -45,6 +74,12 @@ for i in $(seq 1 20); do
     fi
     sleep 0.25
 done
+
+if [[ ! -S "$TS_SOCKET" ]]; then
+    log "tailscaled socket never appeared — see /var/log/tailscaled.log"
+    tail -n 50 /var/log/tailscaled.log >&2 || true
+    die "tailscaled failed to start"
+fi
 
 # ── optional non-interactive auth ──────────────────────────────────────────
 if [[ -n "${TAILSCALE_AUTHKEY:-}" ]]; then

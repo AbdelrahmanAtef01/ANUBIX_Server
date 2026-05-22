@@ -268,24 +268,55 @@ keys — use per-device, ephemeral, or tagged keys, not your personal login.
 
 ---
 
-## 7. Building outside docker-compose
+## 7. Running on a server (AWS EC2 etc.)
 
-If you prefer raw docker:
+### Kernel TUN mode is **mandatory**
+
+The service opens an SSH tunnel to the Jetson over tailscale. `paramiko`
+(under `sshtunnel`) makes a direct TCP connection — it does NOT speak
+SOCKS5. Tailscale's *userspace-networking* mode only routes traffic that
+goes through its SOCKS5 proxy, so without a real TUN device the SSH
+connect times out with `Could not establish session to SSH gateway`.
+
+The entrypoint refuses to start without `/dev/net/tun`, so the failure is
+loud instead of silent.
+
+Pre-flight on the host (Ubuntu EC2 AMIs already pass these):
+
+```bash
+ls -l /dev/net/tun          # → crw-rw-rw- 1 root root 10, 200 …
+# if missing:
+sudo modprobe tun
+```
+
+### Pull and run from Docker Hub
+
+```bash
+docker pull abdelrahmanatef01/anubix-api-client:latest
+
+docker run -d \
+    --name anubix-api-client \
+    --network host \
+    --cap-add NET_ADMIN \
+    --device /dev/net/tun:/dev/net/tun \
+    --env-file /home/ubuntu/.env \
+    -v anubix-tailscale-state:/var/lib/tailscale \
+    --restart unless-stopped \
+    abdelrahmanatef01/anubix-api-client:latest
+
+docker logs -f anubix-api-client
+```
+
+> With `--network host` you don't need `-p 6000:6000`; the container is
+> already on the host's network namespace.
+
+### Build locally instead
 
 ```bash
 docker build \
     -f api_client/service/Dockerfile \
     -t anubix-api-client \
-    "D:/college_projects/Graduation Project/anubix"          # build context = anubix/ root
-
-docker run --rm -it \
-    -p 6000:6000 \
-    --env-file api_client/service/.env \
-    -v anubix-tailscale-state:/var/lib/tailscale \
-    anubix-api-client
+    "D:/college_projects/Graduation Project/anubix"   # build context = anubix/ root
 ```
 
-For kernel TUN tailscale (faster), add:
-```
-    --cap-add NET_ADMIN --device /dev/net/tun:/dev/net/tun
-```
+Then swap the image name in the `docker run` above.
