@@ -16,12 +16,12 @@ GET  /run/{session_id}/status      — poll a previously-accepted run
 
 Fire-and-forget
 ---------------
-/run validates the payload, generates a session_id, schedules the runner on a
-background thread, and returns 202 right away. The runner's output streams
-straight to container stdout (so `docker logs -f` shows the same view the
-CLI would print). A small in-memory registry tracks {queued, running, done,
-failed} per session_id; this is intentionally process-local (cleared on
-restart). For durable results, rely on the Supabase chat-history upload.
+/run validates the payload, schedules the runner on a background thread, and
+returns 202 right away. The runner's output streams straight to container
+stdout (so `docker logs -f` shows the same view the CLI would print). A
+small in-memory registry tracks {queued, running, done, failed} per
+session_id; this is intentionally process-local (cleared on restart). For
+durable results, rely on the Supabase chat-history upload.
 
 Single-runner queue
 -------------------
@@ -30,10 +30,30 @@ FIFO so the physical robot only ever executes one mission at a time.
 
 Per-request Supabase upload
 ---------------------------
-Each /run can include chat_id + user_id + task_id. If ALL three are present,
-this run's anubix text responses are uploaded to public.chats with those
-overrides (and session_id = the runner's session-unique agent_name). If any
-one is missing, the upload step is skipped entirely.
+Each /run can include session_id + user_id + task_id.  If ALL THREE are
+present, this run's anubix text responses are uploaded to public.chats
+using session_id as the grouping key (chat_id is auto-generated per row by
+the DB).  If any of the three is missing, upload is skipped.
+
+Session affinity
+----------------
+The client-facing session_id and the internal OmniLink agent_name are
+separate identifiers. The server maps session_id → agent_name. When a
+request arrives with a previously-used session_id the server looks up the
+original agent_name, restores the conversation history, and routes the
+new request to the same OmniLink agent.
+
+Emergency bypass
+----------------
+Requests containing emergency words (e.g. "stop", "abort", "force stop")
+skip the FIFO queue entirely and dispatch supervisor_force_stop directly
+to the Jetson tool endpoint.
+
+No-tool grace period
+--------------------
+The first two rounds of every run allow the model to respond with text only
+(no tool calls) without triggering nudges. This lets status queries and
+general questions receive a direct answer.
 """
 
 from __future__ import annotations
@@ -89,17 +109,13 @@ JETSON_SSH_PORT = int(os.environ.get("JETSON_SSH_PORT", "22"))
 
 class RequestScopedChatUploader:
     """
-    A per-request variant of ChatHistoryUploader that takes chat_id /
-    user_id / task_id from the request payload instead of module constants.
-
-    chat_id is the PK of public.chats with a uuid_generate_v4() default,
-    so we only send it on the FIRST insert of the run (the user-anchor row).
-    Subsequent rows omit chat_id and the DB auto-generates a fresh PK; they
-    still group with the first row via the shared session_id.
+    Per-request chat uploader.  Takes user_id + task_id from the request.
+    chat_id is auto-generated per row by the DB (uuid_generate_v4).  Rows
+    group via session_id (the client's chat identifier, passed to upload()).
     """
 
     def __init__(self, url: str, key: str,
-                 chat_id: str, user_id: str, task_id: str,
+                 user_id: str, task_id: str,
                  sender: str = "anubix"):
         try:
             from supabase import create_client
@@ -108,11 +124,9 @@ class RequestScopedChatUploader:
                 "supabase-py not installed in the container image."
             ) from exc
         self._client    = create_client(url, key)
-        self.chat_id    = chat_id
         self.user_id    = user_id
         self.task_id    = task_id
         self.sender     = sender
-        self._first_row = True
         self._ok        = 0
         self._fail      = 0
 
@@ -124,9 +138,6 @@ class RequestScopedChatUploader:
             "session_id": session_id,
             "task_id":    self.task_id,
         }
-        if self._first_row:
-            row["chat_id"] = self.chat_id
-            self._first_row = False
         try:
             self._client.table("chats").insert(row).execute()
             self._ok += 1
@@ -162,8 +173,14 @@ class RunRequest(BaseModel):
     messages: Optional[List[Message]]  = Field(default=None, description="Conversation history; "
                                                                           "last message MUST be role=user.")
 
-    # All three required together to enable Supabase upload.
-    chat_id:  Optional[str] = None
+    # Chat identifier.  If provided, identifies the conversation in Supabase
+    # and enables session affinity (same session_id → same OmniLink agent).
+    # If omitted, the server auto-generates a throwaway session_id and treats
+    # the request as a one-off (fire-and-forget, no history to return to).
+    session_id: Optional[str] = Field(default=None,
+                                       description="Chat identifier. Omit for fire-and-forget.")
+
+    # Both required together (alongside session_id) to enable Supabase upload.
     user_id:  Optional[str] = None
     task_id:  Optional[str] = None
 
@@ -206,7 +223,7 @@ app = FastAPI(
     description="HTTP wrapper around anubix_api_client.OmniChatRunner. "
                 "Fire-and-forget /run with a single-runner FIFO queue so the "
                 "physical robot only handles one mission at a time.",
-    version="2.0.0",
+    version="3.0.0",
 )
 
 # asyncio.Lock is FIFO — concurrent /run requests are served in arrival order.
@@ -217,8 +234,8 @@ _jobs: Dict[str, Dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
 
 
-def _new_session_id() -> str:
-    return f"ANUBIX-session-{uuid.uuid4().hex[:8]}"
+def _new_agent_name() -> str:
+    return f"ANUBIX-agent-{uuid.uuid4().hex[:8]}"
 
 
 def _set_job(session_id: str, **fields: Any) -> None:
@@ -232,6 +249,92 @@ def _get_job(session_id: str) -> Optional[Dict[str, Any]]:
     with _jobs_lock:
         job = _jobs.get(session_id)
         return dict(job) if job is not None else None
+
+
+# ── Emergency detection ──────────────────────────────────────────────────
+
+EMERGENCY_EXACT = frozenset({
+    "stop", "halt", "abort", "emergency", "e-stop", "estop",
+})
+EMERGENCY_PHRASES = frozenset({
+    "force stop", "emergency stop", "stop now", "stop everything",
+    "abort mission", "stop immediately",
+})
+
+
+def _is_emergency(text: str) -> bool:
+    lower = text.strip().lower()
+    if lower in EMERGENCY_EXACT:
+        return True
+    return any(phrase in lower for phrase in EMERGENCY_PHRASES)
+
+
+# ── Session registry (session_id → agent_name + conversation history) ────
+# The client-facing session_id is different from the internal OmniLink
+# agent_name.  When a request arrives with a previously-used session_id we
+# look up which agent_name was used so OmniLink routes it to the same agent
+# (preserving its server-side memory) and we restore the conversation.
+
+_session_registry: Dict[str, Dict[str, Any]] = {}
+_session_registry_lock = threading.Lock()
+
+
+def _register_session(session_id: str, agent_name: str, messages: list) -> None:
+    with _session_registry_lock:
+        _session_registry[session_id] = {
+            "agent_name": agent_name,
+            "messages": list(messages),
+        }
+
+
+def _lookup_session(session_id: str) -> Optional[Dict[str, Any]]:
+    with _session_registry_lock:
+        entry = _session_registry.get(session_id)
+        if entry is None:
+            return None
+        return {"agent_name": entry["agent_name"], "messages": list(entry["messages"])}
+
+
+async def _handle_emergency(req: RunRequest) -> RunAccepted:
+    """Bypass the FIFO queue and send force_stop directly to the Jetson."""
+    session_id = req.session_id or f"tmp-{uuid.uuid4().hex[:8]}"
+
+    print(f"\n[EMERGENCY] ⚠ session={session_id} — bypassing queue, "
+          f"sending force_stop directly to Jetson", flush=True)
+
+    tool_client = ac.JetsonToolClient(
+        local_port=ac.DEFAULT_LOCAL_PORT,
+        timeout=10,
+    )
+
+    try:
+        ok, result = await asyncio.to_thread(
+            tool_client.dispatch, "supervisor_force_stop", {},
+        )
+    except Exception as exc:  # noqa: BLE001
+        ok, result = False, f"{type(exc).__name__}: {exc}"
+
+    status_str = "done" if ok else "failed"
+    print(f"[EMERGENCY] force_stop: ok={ok} result={result}", flush=True)
+
+    _set_job(
+        session_id,
+        status              = status_str,
+        final_text          = f"EMERGENCY force_stop: {result}",
+        chat_upload_enabled = False,
+        chat_upload_stats   = None,
+        error               = None if ok else result,
+        started_at          = time.time(),
+        finished_at         = time.time(),
+    )
+
+    return RunAccepted(
+        session_id          = session_id,
+        status              = status_str,
+        chat_upload_enabled = False,
+        message             = f"EMERGENCY: force_stop dispatched (bypassed queue). "
+                              f"Result: {result}",
+    )
 
 
 @app.get("/health")
@@ -263,7 +366,6 @@ async def ts_up(req: TailscaleUpRequest) -> dict:
 
 @app.post("/run", status_code=status.HTTP_202_ACCEPTED, response_model=RunAccepted)
 async def run(req: RunRequest) -> RunAccepted:
-    # Validate exactly-one-of prompt | messages.
     if not req.prompt and not req.messages:
         raise HTTPException(400, "Either 'prompt' or 'messages' is required.")
     if req.prompt and req.messages:
@@ -271,19 +373,39 @@ async def run(req: RunRequest) -> RunAccepted:
     if req.messages and (not req.messages or req.messages[-1].role != "user"):
         raise HTTPException(400, "'messages' must end with a role='user' entry.")
 
-    # Supabase upload requires all three IDs.
-    upload_ids = [req.chat_id, req.user_id, req.task_id]
+    prompt_text = req.prompt or req.messages[-1].content
+
+    if _is_emergency(prompt_text):
+        return await _handle_emergency(req)
+
+    upload_ids = [req.session_id, req.user_id, req.task_id]
     upload_enabled = all(upload_ids)
     if any(upload_ids) and not upload_enabled:
-        raise HTTPException(
-            400,
-            "chat_id, user_id, and task_id must all be provided together "
-            "(or all omitted to skip Supabase upload).",
-        )
+        non_null = [k for k, v in [("session_id", req.session_id),
+                                    ("user_id", req.user_id),
+                                    ("task_id", req.task_id)] if v]
+        missing  = [k for k, v in [("session_id", req.session_id),
+                                    ("user_id", req.user_id),
+                                    ("task_id", req.task_id)] if not v]
+        if req.user_id or req.task_id:
+            raise HTTPException(
+                400,
+                f"Supabase upload requires session_id, user_id, and task_id together. "
+                f"Got: {', '.join(non_null)}. Missing: {', '.join(missing)}.",
+            )
 
-    # Pre-assign the session_id so we can return it immediately. The runner
-    # will reuse it as its agent_name.
-    session_id = _new_session_id()
+    if req.session_id:
+        session_id = req.session_id
+        existing_job = _get_job(session_id)
+        if existing_job and existing_job["status"] in ("queued", "running"):
+            raise HTTPException(
+                409,
+                f"Session {session_id} is currently {existing_job['status']}. "
+                "Wait for it to finish before sending a follow-up.",
+            )
+    else:
+        session_id = f"tmp-{uuid.uuid4().hex[:8]}"
+
     _set_job(
         session_id,
         status              = "queued",
@@ -295,8 +417,6 @@ async def run(req: RunRequest) -> RunAccepted:
         finished_at         = None,
     )
 
-    # Launch the worker; do NOT await it. The asyncio.Lock inside the worker
-    # still serialises concurrent jobs FIFO.
     asyncio.create_task(_run_worker(session_id, req, upload_enabled))
 
     print(f"[run] accepted session={session_id} "
@@ -351,8 +471,14 @@ def _execute_run(session_id: str, req: RunRequest, upload_enabled: bool) -> None
     if upload_enabled:
         chat_uploader = RequestScopedChatUploader(
             url=ac.SUPABASE_URL, key=ac.SUPABASE_KEY,
-            chat_id=req.chat_id, user_id=req.user_id, task_id=req.task_id,
+            user_id=req.user_id, task_id=req.task_id,
         )
+
+    if req.messages:
+        print(f"\n[run] session={session_id} received {len(req.messages)} messages:",
+              flush=True)
+        for i, m in enumerate(req.messages):
+            print(f"  msg[{i+1}] role={m.role}: {m.content[:300]}", flush=True)
 
     if req.prompt:
         seed_messages = []
@@ -361,8 +487,18 @@ def _execute_run(session_id: str, req: RunRequest, upload_enabled: bool) -> None
         seed_messages = [m.model_dump() for m in (req.messages or [])[:-1]]
         user_prompt   = (req.messages or [])[-1].content
 
+    existing = _lookup_session(session_id)
+    if existing:
+        agent_name = existing["agent_name"]
+        print(f"[run] session={session_id} → reusing agent_name={agent_name}, "
+              f"restoring {len(existing['messages'])} messages", flush=True)
+        seed_messages = existing["messages"] + seed_messages
+    else:
+        agent_name = _new_agent_name()
+        print(f"[run] session={session_id} → new agent_name={agent_name}", flush=True)
+
     final_text = ""
-    print(f"\n[run] ▶ session={session_id} starting", flush=True)
+    print(f"\n[run] ▶ session={session_id} agent={agent_name} starting", flush=True)
 
     try:
         with ac.JetsonTunnel(
@@ -380,18 +516,21 @@ def _execute_run(session_id: str, req: RunRequest, upload_enabled: bool) -> None
             ac.health_check(tool_client)
 
             runner = ac.OmniChatRunner(
-                api_key       = OMNI_KEY,
-                tool_client   = tool_client,
-                engine        = req.engine,
-                max_rounds    = req.max_rounds,
-                temperature   = req.temperature,
-                share_memory  = req.share_memory,
-                chat_uploader = chat_uploader,
-                agent_name    = session_id,   # so the session_id we returned == OmniLink agent_name
+                api_key           = OMNI_KEY,
+                tool_client       = tool_client,
+                engine            = req.engine,
+                max_rounds        = req.max_rounds,
+                temperature       = req.temperature,
+                share_memory      = req.share_memory,
+                chat_uploader     = chat_uploader,
+                agent_name        = agent_name,
+                no_tool_rounds    = 2,
+                upload_session_id = session_id,
             )
             if seed_messages:
                 runner.messages = list(seed_messages)
             final_text = runner.run(user_prompt)
+            _register_session(session_id, agent_name, runner.messages)
     except Exception as exc:  # noqa: BLE001
         err_str = f"{type(exc).__name__}: {exc}"
         print(f"[run] ✗ session={session_id} aborted: {err_str}",

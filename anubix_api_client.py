@@ -582,6 +582,8 @@ class OmniChatRunner:
         temperature:  Optional[float] = 0.1,
         share_memory: bool          = False,
         chat_uploader: Optional[ChatHistoryUploader] = None,
+        no_tool_rounds: int         = 0,
+        upload_session_id: Optional[str] = None,
     ):
         self.api_key      = api_key
         self.tool_client  = tool_client
@@ -591,6 +593,7 @@ class OmniChatRunner:
         self.temperature  = temperature
         self.agent_persona = agent_persona
         self.chat_uploader = chat_uploader
+        self.no_tool_rounds = no_tool_rounds
 
         # IMPORTANT: agentName scopes persistent memory on the OmniLink server.
         # Re-using "ANUBIX" makes the server CONCATENATE prior conversation
@@ -602,6 +605,8 @@ class OmniChatRunner:
             self.agent_name = agent_name or "ANUBIX"
         else:
             self.agent_name = f"ANUBIX-session-{uuid.uuid4().hex[:8]}"
+
+        self.upload_session_id = upload_session_id or self.agent_name
 
         # Whole file → mainTask. This mirrors configure_anubix_agent.py exactly.
         # Everything about the agent's text/tool behavior lives in the prompt
@@ -725,10 +730,17 @@ class OmniChatRunner:
             # Persist this round's anubix text to public.chats. Skip empty
             # texts (model emitted only tool calls, nothing to log).
             if text.strip() and self.chat_uploader is not None:
-                self.chat_uploader.upload(text, session_id=self.agent_name)
+                self.chat_uploader.upload(text, session_id=self.upload_session_id)
 
             if not tool_calls:
                 finish = _finish_reason(data.get("raw", {}))
+
+                if round_idx < self.no_tool_rounds and last_tool is None:
+                    print(f"{C.DIM}[done] Round {round_idx + 1} (no-tool grace) "
+                          f"— accepting text as final answer.{C.R}")
+                    print_final(text)
+                    self.messages.append({"role": "assistant", "content": text})
+                    return text
 
                 # Terminal tools end the run; anything else means we got
                 # stalled mid-sequence and should nudge.

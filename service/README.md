@@ -3,7 +3,7 @@
 A thin FastAPI wrapper around `anubix_api_client.OmniChatRunner`.
 
 ```
-POST /run  ─►  validate + assign session_id  ─►  202 Accepted (immediate)
+POST /run  ─►  validate (session_id required)  ─►  202 Accepted (immediate)
                                                        │
                                                        ▼
                                   asyncio.Lock (FIFO)  ─►  OmniChatRunner.run()
@@ -87,9 +87,15 @@ POST /run
     { "role": "user",      "content": "…" }     // last MUST be user
   ],
 
-  // OPTIONAL — all three together enable Supabase chat-history upload.
-  // Provide them OR omit them all. Mixed = 400.
-  "chat_id": "uuid",
+  // OPTIONAL — identifies the chat.  Replaces the old chat_id.
+  // If provided: all Supabase rows share this value, and sending the same
+  // session_id again routes to the same OmniLink agent (session affinity).
+  // If omitted: a throwaway session is created (fire-and-forget, no
+  // history to return to).
+  "session_id": "my-chat-uuid-or-slug",
+
+  // OPTIONAL — all three (session_id + user_id + task_id) enable Supabase
+  // upload.  Provide all three or omit them.  Mixed = 400.
   "user_id": "uuid",
   "task_id": "uuid",
 
@@ -153,7 +159,8 @@ curl -X POST http://localhost:6000/run \
   -d '{
     "prompt": "go check if the plant at x=70 and y=75 has any diseases, your robot id is 34a957fd-d45c-4dbf-8e02-be8e1b5e349a, and the task id is 40e4060b-5bc8-4044-9d71-046fee27a757"
   }'
-# → { "session_id": "ANUBIX-session-…", "status": "queued", … }
+# → { "session_id": "tmp-a3f2e1c0", "status": "queued", … }
+# No session_id → throwaway session, no history to return to.
 ```
 
 ### b) Single prompt **with Supabase upload**
@@ -162,24 +169,27 @@ curl -X POST http://localhost:6000/run \
 curl -X POST http://localhost:6000/run \
   -H 'content-type: application/json' \
   -d '{
+    "session_id": "abc-chat-002",
     "prompt":  "go check disease at x=70 y=75, robot=34a957fd-d45c-4dbf-8e02-be8e1b5e349a, task=40e4060b-5bc8-4044-9d71-046fee27a757",
-    "chat_id": "11111111-2222-3333-4444-555555555555",
     "user_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
     "task_id": "99999999-8888-7777-6666-555555555555"
   }'
 ```
 
-### c) Multi-turn `messages` array
+### c) Multi-turn `messages` array **with Supabase upload**
 
 ```bash
 curl -X POST http://localhost:6000/run \
   -H 'content-type: application/json' \
   -d '{
+    "session_id": "abc-chat-003",
     "messages": [
       { "role": "user",      "content": "what robots can you control?" },
       { "role": "assistant", "content": "I control the ANUBIX agritech robot." },
       { "role": "user",      "content": "great, now check disease at x=12 y=34, robot=34a957fd-d45c-4dbf-8e02-be8e1b5e349a, task=40e4060b-5bc8-4044-9d71-046fee27a757" }
-    ]
+    ],
+    "user_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    "task_id": "99999999-8888-7777-6666-555555555555"
   }'
 ```
 
@@ -189,7 +199,8 @@ curl -X POST http://localhost:6000/run \
 curl -X POST http://localhost:6000/run \
   -H 'content-type: application/json' \
   -d '{
-    "prompt":      "stop",
+    "session_id": "abc-chat-004",
+    "prompt":      "what is the robot status?",
     "engine":      "g1-engine",
     "temperature": 0.0,
     "max_rounds":  10
@@ -199,22 +210,60 @@ curl -X POST http://localhost:6000/run \
 ### e) Poll a run until it finishes
 
 ```bash
-SID=$(curl -s -X POST http://localhost:6000/run \
+curl -s -X POST http://localhost:6000/run \
   -H 'content-type: application/json' \
-  -d '{ "prompt": "go home" }' | jq -r .session_id)
+  -d '{ "session_id": "poll-test-001", "prompt": "what can you do?" }'
 
 # Poll every 5s. Live transcript still appears in `docker logs -f`.
 while true; do
-  STATUS=$(curl -s "http://localhost:6000/run/$SID/status" | jq -r .status)
-  echo "$(date +%T)  $SID  $STATUS"
+  STATUS=$(curl -s "http://localhost:6000/run/poll-test-001/status" | jq -r .status)
+  echo "$(date +%T)  poll-test-001  $STATUS"
   case "$STATUS" in done|failed) break;; esac
   sleep 5
 done
 
-curl -s "http://localhost:6000/run/$SID/status" | jq .
+curl -s "http://localhost:6000/run/poll-test-001/status" | jq .
 ```
 
-### f) Tailscale auth flow
+### f) Emergency stop (bypasses queue)
+
+```bash
+curl -X POST http://localhost:6000/run \
+  -H 'content-type: application/json' \
+  -d '{ "prompt": "stop" }'
+# → Immediately dispatches supervisor_force_stop to the Jetson,
+#   even if another mission is in flight. Does NOT wait in queue.
+# session_id is optional for emergencies.
+```
+
+Emergency words: `stop`, `halt`, `abort`, `emergency`, `e-stop`, `estop`,
+`force stop`, `emergency stop`, `stop now`, `stop everything`,
+`abort mission`, `stop immediately`.
+
+### g) Continue a previous session (session affinity)
+
+```bash
+# First request — client provides its own session_id:
+curl -X POST http://localhost:6000/run \
+  -H 'content-type: application/json' \
+  -d '{
+    "session_id": "my-chat-42",
+    "prompt": "what can you do?"
+  }'
+# → { "session_id": "my-chat-42", "status": "queued", … }
+
+# Second request — same session_id routes to the same OmniLink agent
+# and restores the full conversation history:
+curl -X POST http://localhost:6000/run \
+  -H 'content-type: application/json' \
+  -d '{
+    "session_id": "my-chat-42",
+    "prompt": "ok, go check disease at x=70 y=75, robot=34a957fd-d45c-4dbf-8e02-be8e1b5e349a, task=40e4060b-5bc8-4044-9d71-046fee27a757"
+  }'
+# → The agent remembers the prior exchange and continues from there.
+```
+
+### h) Tailscale auth flow
 
 ```bash
 # 1. Check current state
@@ -246,7 +295,56 @@ calls, tool results, nudges).
 
 ---
 
-## 6. Secrets handling
+## 6. Session affinity, emergency bypass & no-tool grace
+
+### Session affinity
+
+`session_id` (provided by the client) identifies the chat. Internally the
+server generates a separate `agent_name` for OmniLink routing and
+maintains a mapping: `session_id → agent_name + messages`.
+If `session_id` is omitted, a throwaway `tmp-*` id is generated and the
+request is fire-and-forget (no history to return to).
+
+When a request arrives with a `session_id` that has been seen before:
+1. The server looks up which `agent_name` was paired with it.
+2. It restores the full conversation history from the previous run.
+3. It routes the new request to the same OmniLink agent.
+
+When a `session_id` is new, a fresh `agent_name` is generated and the
+request is treated as a brand-new conversation.
+
+If the session is still `queued` or `running`, the server returns
+`409 Conflict` — wait for it to finish first.
+
+Supabase rows are always grouped by `session_id` (the client's value),
+never by the internal `agent_name`.
+
+### Emergency bypass
+
+If the prompt is (or contains) an emergency phrase — `stop`, `halt`,
+`abort`, `force stop`, etc. — the request **bypasses the FIFO queue** and
+dispatches `supervisor_force_stop` directly to the Jetson tool endpoint.
+This works even while another mission is in flight, because the existing
+SSH tunnel is already forwarding `localhost:5055`.
+
+### No-tool grace period
+
+The first two rounds of every run allow the model to respond with text only
+(no tool calls) without triggering the nudge loop. This means simple
+questions like _"what can you do?"_ or _"what is the robot's status?"_ get
+a direct text answer instead of the model being pushed to emit a tool call.
+From round 3 onward the normal nudge-on-missing-tool-call logic applies.
+
+### Required parameters
+
+The agent prompt enforces that all four parameters — `robot_id`, `task_id`,
+`x`, `y` — must be present in the user message before any tool calls are
+emitted. If any are missing, the agent replies with text asking the user to
+provide them. General questions and emergency stops are exempt.
+
+---
+
+## 7. Secrets handling
 
 | Where it lives | Used for |
 |---|---|
@@ -268,7 +366,7 @@ keys — use per-device, ephemeral, or tagged keys, not your personal login.
 
 ---
 
-## 7. Running on a server (AWS EC2 etc.)
+## 8. Running on a server (AWS EC2 etc.)
 
 ### Kernel TUN mode is **mandatory**
 
