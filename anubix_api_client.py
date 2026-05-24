@@ -55,6 +55,7 @@ import os
 import socket
 import sys
 import textwrap
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -569,6 +570,10 @@ class ChatHistoryUploader:
 
 # ─── /api/chat client + dispatch loop ──────────────────────────────────────
 
+class _AbortedError(Exception):
+    pass
+
+
 class OmniChatRunner:
     def __init__(
         self,
@@ -709,6 +714,49 @@ class OmniChatRunner:
             f"Last error: {last_error}"
         )
 
+    def _is_aborted(self) -> bool:
+        return self.abort_event is not None and self.abort_event.is_set()
+
+    def _abort_exit(self) -> str:
+        msg = "Run aborted by emergency stop."
+        print(f"{C.RED}[abort] {msg}{C.R}")
+        self.messages.append({"role": "assistant", "content": msg})
+        return msg
+
+    def _dispatch_interruptible(self, name: str, args: dict) -> tuple[bool, str]:
+        if self.abort_event is None:
+            return self.tool_client.dispatch(name, args)
+        result: list = [False, '{"error":"aborted"}']
+        def _run() -> None:
+            result[0], result[1] = self.tool_client.dispatch(name, args)
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        while t.is_alive():
+            if self.abort_event.is_set():
+                return False, json.dumps({"error": "aborted", "detail": "Emergency stop"})
+            t.join(timeout=1.0)
+        return result[0], result[1]
+
+    def _post_chat_interruptible(self) -> dict:
+        if self.abort_event is None:
+            return self._post_chat()
+        result: list = [None]
+        exc_holder: list = [None]
+        def _run() -> None:
+            try:
+                result[0] = self._post_chat()
+            except Exception as e:
+                exc_holder[0] = e
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        while t.is_alive():
+            if self.abort_event.is_set():
+                raise _AbortedError()
+            t.join(timeout=1.0)
+        if exc_holder[0] is not None:
+            raise exc_holder[0]
+        return result[0]
+
     def run(self, user_prompt: str) -> str:
         """Run one full prompt → final-answer loop. Returns the final text."""
         self.messages.append({"role": "user", "content": user_prompt})
@@ -718,17 +766,19 @@ class OmniChatRunner:
         nudge_count = 0                   # consecutive nudges this run
 
         for round_idx in range(self.max_rounds):
-            if self.abort_event is not None and self.abort_event.is_set():
-                msg = "Run aborted by emergency stop."
-                print(f"{C.RED}[abort] {msg}{C.R}")
-                self.messages.append({"role": "assistant", "content": msg})
-                return msg
+            if self._is_aborted():
+                return self._abort_exit()
 
             try:
-                data = self._post_chat()
+                data = self._post_chat_interruptible()
+            except _AbortedError:
+                return self._abort_exit()
             except RuntimeError as exc:
                 print(f"{C.RED}{exc}{C.R}")
                 return ""
+
+            if self._is_aborted():
+                return self._abort_exit()
 
             text       = data.get("text") or ""
             tool_calls = data.get("toolCalls") or []
@@ -797,7 +847,9 @@ class OmniChatRunner:
                 args  = tc.get("arguments") or {}
                 print_tool_call(i, len(tool_calls), name, args)
 
-                ok, result_str = self.tool_client.dispatch(name, args)
+                ok, result_str = self._dispatch_interruptible(name, args)
+                if self._is_aborted():
+                    return self._abort_exit()
                 print_tool_result(name, result_str, ok)
 
                 self.messages.append({
