@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sys
 import threading
 import time
@@ -253,18 +254,23 @@ def _get_job(session_id: str) -> Optional[Dict[str, Any]]:
 
 # ── Emergency detection ──────────────────────────────────────────────────
 
-EMERGENCY_EXACT = frozenset({
-    "stop", "halt", "abort", "emergency", "e-stop", "estop",
+EMERGENCY_WORDS = frozenset({
+    "stop", "halt", "abort", "emergency", "e-stop", "estop", "cancel",
 })
 EMERGENCY_PHRASES = frozenset({
     "force stop", "emergency stop", "stop now", "stop everything",
-    "abort mission", "stop immediately",
+    "abort mission", "stop immediately", "force_stop",
 })
+
+_WORD_RE = re.compile(r"\b[\w-]+\b")
 
 
 def _is_emergency(text: str) -> bool:
     lower = text.strip().lower()
-    if lower in EMERGENCY_EXACT:
+    if lower in EMERGENCY_WORDS:
+        return True
+    words = set(_WORD_RE.findall(lower))
+    if words & EMERGENCY_WORDS:
         return True
     return any(phrase in lower for phrase in EMERGENCY_PHRASES)
 
