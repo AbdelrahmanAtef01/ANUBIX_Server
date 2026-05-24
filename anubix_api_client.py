@@ -584,6 +584,7 @@ class OmniChatRunner:
         chat_uploader: Optional[ChatHistoryUploader] = None,
         no_tool_rounds: int         = 0,
         upload_session_id: Optional[str] = None,
+        abort_event: Optional[Any]  = None,
     ):
         self.api_key      = api_key
         self.tool_client  = tool_client
@@ -594,6 +595,7 @@ class OmniChatRunner:
         self.agent_persona = agent_persona
         self.chat_uploader = chat_uploader
         self.no_tool_rounds = no_tool_rounds
+        self.abort_event = abort_event
 
         # IMPORTANT: agentName scopes persistent memory on the OmniLink server.
         # Re-using "ANUBIX" makes the server CONCATENATE prior conversation
@@ -716,6 +718,12 @@ class OmniChatRunner:
         nudge_count = 0                   # consecutive nudges this run
 
         for round_idx in range(self.max_rounds):
+            if self.abort_event is not None and self.abort_event.is_set():
+                msg = "Run aborted by emergency stop."
+                print(f"{C.RED}[abort] {msg}{C.R}")
+                self.messages.append({"role": "assistant", "content": msg})
+                return msg
+
             try:
                 data = self._post_chat()
             except RuntimeError as exc:

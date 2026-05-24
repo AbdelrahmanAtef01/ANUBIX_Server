@@ -234,6 +234,11 @@ _runner_lock = asyncio.Lock()
 _jobs: Dict[str, Dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
 
+# Abort event for the currently running mission.  Only one mission runs at
+# a time (FIFO lock), so a single event suffices.
+_active_abort: Optional[threading.Event] = None
+_active_abort_lock = threading.Lock()
+
 
 def _new_agent_name() -> str:
     return f"ANUBIX-agent-{uuid.uuid4().hex[:8]}"
@@ -304,6 +309,12 @@ def _lookup_session(session_id: str) -> Optional[Dict[str, Any]]:
 async def _handle_emergency(req: RunRequest) -> RunAccepted:
     """Bypass the FIFO queue and send force_stop directly to the Jetson."""
     session_id = req.session_id or f"tmp-{uuid.uuid4().hex[:8]}"
+
+    with _active_abort_lock:
+        abort_ev = _active_abort
+    if abort_ev is not None:
+        abort_ev.set()
+        print(f"[EMERGENCY] signalled abort to running mission", flush=True)
 
     print(f"\n[EMERGENCY] ⚠ session={session_id} — bypassing queue, "
           f"sending force_stop directly to Jetson", flush=True)
@@ -503,6 +514,11 @@ def _execute_run(session_id: str, req: RunRequest, upload_enabled: bool) -> None
         agent_name = _new_agent_name()
         print(f"[run] session={session_id} → new agent_name={agent_name}", flush=True)
 
+    abort_event = threading.Event()
+    global _active_abort
+    with _active_abort_lock:
+        _active_abort = abort_event
+
     final_text = ""
     print(f"\n[run] ▶ session={session_id} agent={agent_name} starting", flush=True)
 
@@ -532,14 +548,17 @@ def _execute_run(session_id: str, req: RunRequest, upload_enabled: bool) -> None
                 agent_name        = agent_name,
                 no_tool_rounds    = 2,
                 upload_session_id = session_id,
+                abort_event       = abort_event,
             )
             if seed_messages:
                 runner.messages = list(seed_messages)
             final_text = runner.run(user_prompt)
             _register_session(session_id, agent_name, runner.messages)
     except Exception as exc:  # noqa: BLE001
+        with _active_abort_lock:
+            _active_abort = None
         err_str = f"{type(exc).__name__}: {exc}"
-        print(f"[run] ✗ session={session_id} aborted: {err_str}",
+        print(f"[run] ✗ session={session_id} failed: {err_str}",
               flush=True, file=sys.stderr)
         _set_job(
             session_id,
@@ -551,10 +570,15 @@ def _execute_run(session_id: str, req: RunRequest, upload_enabled: bool) -> None
         )
         return
 
-    print(f"[run] ✓ session={session_id} done", flush=True)
+    with _active_abort_lock:
+        _active_abort = None
+
+    status_label = "aborted" if abort_event.is_set() else "done"
+    print(f"[run] {'✗' if abort_event.is_set() else '✓'} session={session_id} {status_label}",
+          flush=True)
     _set_job(
         session_id,
-        status            = "done",
+        status            = status_label,
         final_text        = final_text,
         chat_upload_stats = chat_uploader.stats if chat_uploader else None,
         finished_at       = time.time(),
